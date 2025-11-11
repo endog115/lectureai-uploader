@@ -1,54 +1,50 @@
+/* ------------------ IMPORTS ------------------ */
 import express from "express";
 import multer from "multer";
 import fetch from "node-fetch";
 import fs from "fs";
+import ffmpeg from "fluent-ffmpeg";
 import Stripe from "stripe";
 import dotenv from "dotenv";
 import OpenAI from "openai";
+import bodyParser from "body-parser";
+import cors from "cors";
 import { createClient } from "@supabase/supabase-js";
 import SibApiV3Sdk from "sib-api-v3-sdk";
 
+/* ------------------ CONFIG ------------------ */
 dotenv.config();
-
-/* ------------------ APP SETUP ------------------ */
 const app = express();
 const upload = multer({ dest: "uploads/" });
-const port = process.env.PORT || 10000;
+const port = process.env.PORT || 3000;
 
-/* ------------------ THIRD-PARTY CLIENTS ------------------ */
+/* ------------------ GLOBAL CLIENTS ------------------ */
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-
-// Brevo email setup
 const brevoClient = SibApiV3Sdk.ApiClient.instance;
 brevoClient.authentications["api-key"].apiKey = process.env.BREVO_API_KEY;
 const brevo = new SibApiV3Sdk.TransactionalEmailsApi();
 
-/* ------------------ CORS (FINAL FIX) ------------------ */
-const allowedOrigins = [
-  "https://lectureai-saas-websi-wchx.bolt.host",
-  "https://lectureai-saas-websi-a50f.bolt.host",
-  "http://localhost:5173",
-];
+/* ------------------ CORS (CRITICAL FIX) ------------------ */
+app.use(
+  cors({
+    origin: [
+      "https://lectureai-saas-websi-wchx.bolt.host", // ✅ Your Bolt frontend
+      "https://lectureai-uploader.onrender.com",     // ✅ Your Render backend
+    ],
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true,
+    optionsSuccessStatus: 204,
+  })
+);
 
-// Manual CORS + OPTIONS handler
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (allowedOrigins.includes(origin)) {
-    res.header("Access-Control-Allow-Origin", origin);
-  }
-  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.header("Access-Control-Allow-Credentials", "true");
+// ✅ Express 5+ compatible wildcard fix
+app.options(/.*/, cors());
 
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(204);
-  }
-
-  next();
-});
-
+/* ------------------ MIDDLEWARE ------------------ */
+app.use(bodyParser.json({ limit: "50mb" }));
 app.use(express.json({ limit: "50mb" }));
 
 /* ------------------ STRIPE WEBHOOK ------------------ */
@@ -81,13 +77,11 @@ app.post(
         });
 
         console.log(`💾 Stored subscription for user ${user_id}`);
-      } else {
-        console.log("Unhandled Stripe event:", event.type);
       }
 
       res.json({ received: true });
     } catch (err) {
-      console.error("⚠️ Stripe webhook error:", err.message);
+      console.error("⚠️ Webhook verification failed:", err.message);
       res.status(400).send(`Webhook Error: ${err.message}`);
     }
   }
@@ -108,7 +102,7 @@ async function authorizeB2() {
 }
 await authorizeB2();
 
-/* ------------------ FILE UPLOAD ------------------ */
+/* ------------------ UPLOAD ------------------ */
 app.post("/upload", upload.single("file"), async (req, res) => {
   try {
     const file = req.file;
@@ -136,7 +130,6 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 
     const result = await uploadRes.json();
     fs.unlinkSync(file.path);
-
     res.json({ message: "✅ File uploaded successfully", result });
   } catch (err) {
     console.error("❌ Upload error:", err);
@@ -171,70 +164,20 @@ app.get("/signed-download", async (req, res) => {
   }
 });
 
-/* ------------------ ANALYZE ------------------ */
-app.post("/analyze", async (req, res) => {
-  try {
-    const { fileName, email } = req.body;
-    console.log(`🎧 Starting analysis for ${fileName} → ${email}`);
-
-    const signed = await fetch(
-      `${process.env.SERVER_URL || `http://localhost:${port}`}/signed-download?fileName=${encodeURIComponent(fileName)}`
-    );
-    const { downloadUrl, authorizationHeader } = await signed.json();
-
-    const audioRes = await fetch(downloadUrl, {
-      headers: { Authorization: authorizationHeader },
-    });
-    const audioBuffer = await audioRes.arrayBuffer();
-
-    console.log(`Downloaded audio bytes: ${audioBuffer.byteLength}`);
-    console.log("🧠 Transcribing lecture...");
-
-    const transcription = await openai.audio.transcriptions.create({
-      file: new File([audioBuffer], "lecture.mp3"),
-      model: "gpt-4o-mini-transcribe",
-    });
-
-    const text = transcription.text || "";
-    console.log(`Transcription length: ${text.length}`);
-
-    console.log("🪄 Creating notes with GPT-4...");
-    const notesPrompt = `Summarize the following lecture into well-structured study notes with headings and bullet points:\n\n${text}`;
-    const summary = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: notesPrompt }],
-    });
-    const notes = summary.choices[0].message.content;
-
-    console.log("📧 Sending email via Brevo...");
-    await brevo.sendTransacEmail({
-      sender: { email: "no-reply@lectureai.app", name: "LectureAI" },
-      to: [{ email }],
-      subject: `Lecture Notes: ${fileName}`,
-      htmlContent: `<h2>Your Lecture Notes</h2><pre>${notes}</pre>`,
-    });
-
-    console.log("✅ Done — notes sent!");
-    res.json({
-      message: "✅ Analysis complete and notes emailed",
-      fileName,
-      email,
-      sample: notes.slice(0, 300) + "...",
-    });
-  } catch (err) {
-    console.error("❌ Analysis error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 /* ------------------ STRIPE CHECKOUT ------------------ */
 app.post("/create-checkout-session", async (req, res) => {
   try {
     const { plan_type, user_id, email } = req.body;
+    console.log("🎯 Incoming checkout request:", { plan_type, user_id, email });
+
     const priceId =
       plan_type === "subscription"
         ? process.env.PRICE_ID_SUBSCRIPTION
         : process.env.PRICE_ID_SINGLE;
+
+    if (!priceId) {
+      throw new Error("Missing Stripe price ID in environment");
+    }
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
@@ -246,10 +189,10 @@ app.post("/create-checkout-session", async (req, res) => {
       metadata: { user_id, plan_type },
     });
 
-    console.log(`💰 Created checkout for ${email} (${plan_type})`);
+    console.log("✅ Stripe session created:", session.id);
     res.json({ url: session.url });
   } catch (err) {
-    console.error("❌ Checkout error:", err);
+    console.error("❌ Checkout error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -268,12 +211,12 @@ app.post("/create-portal-session", async (req, res) => {
 
     res.json({ url: portal.url });
   } catch (err) {
-    console.error("❌ Billing portal error:", err);
+    console.error("❌ Portal session error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-/* ------------------ START SERVER ------------------ */
+/* ------------------ SERVER START ------------------ */
 app.listen(port, () => {
-  console.log(`🚀 Server running on port ${port}`);
+  console.log(`🚀 Server running on http://localhost:${port}`);
 });
