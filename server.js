@@ -1,7 +1,7 @@
-/* ----------------------------------------------------
-   LectureAI Uploader + Payment Server (Final Build)
+/* ------------------------------------------------------------
+   LectureAI Uploader + Stripe Checkout Server (Final Version)
    Author: Gunner Endicott
-   ---------------------------------------------------- */
+------------------------------------------------------------- */
 
 import express from "express";
 import dotenv from "dotenv";
@@ -11,7 +11,7 @@ import fetch from "node-fetch";
 import Stripe from "stripe";
 import bodyParser from "body-parser";
 import { createClient } from "@supabase/supabase-js";
-import SibApiV3Sdk from "sib-api-v3-sdk";
+import fs from "fs";
 
 dotenv.config();
 
@@ -24,18 +24,20 @@ const upload = multer({ dest: "uploads/" });
 
 /* ---------- MIDDLEWARE ---------- */
 
-// Enable CORS for your Bolt site
+// Allow your Bolt domains to access this API
 app.use(
   cors({
     origin: [
-      "https://lectureai-saas-websi-wchx.bolt.host",
       "https://lectureai.bolt.host",
+      "https://lectureai-saas-websi-wchx.bolt.host",
     ],
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
     credentials: true,
   })
 );
 
-// Parse JSON for all routes except the Stripe webhook (which must remain raw)
+// Parse JSON except for Stripe webhook (must stay raw)
 app.use((req, res, next) => {
   if (req.originalUrl === "/stripe/webhook") {
     next();
@@ -44,26 +46,34 @@ app.use((req, res, next) => {
   }
 });
 
-/* ---------- ROUTES ---------- */
-
-// Root test
+/* ---------- TEST ROUTE ---------- */
 app.get("/", (req, res) => {
-  res.send("✅ LectureAI Uploader Server is running!");
+  res.send("✅ LectureAI Uploader Server is live and running!");
 });
 
-/* -----------------------------
-   STRIPE CHECKOUT
------------------------------ */
-
+/* ============================================================
+   1️⃣  STRIPE CHECKOUT SESSION
+============================================================ */
 app.post("/create-checkout-session", async (req, res) => {
   try {
+    console.log("📩 Incoming checkout request:", req.body);
     const { priceId, email, plan_type, user_id } = req.body;
+
+    if (!priceId) {
+      console.error("❌ Missing priceId in request body");
+      return res.status(400).json({ error: "Missing priceId" });
+    }
 
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
       payment_method_types: ["card"],
-      line_items: [{ price: priceId, quantity: 1 }],
-      customer_email: email,
+      line_items: [
+        {
+          price: priceId, // ✅ Required field
+          quantity: 1,
+        },
+      ],
+      customer_email: email || undefined,
       metadata: {
         plan_type: plan_type || "unknown",
         user_id: user_id || "none",
@@ -72,67 +82,70 @@ app.post("/create-checkout-session", async (req, res) => {
       cancel_url: process.env.CANCEL_URL,
     });
 
-    console.log("✅ Stripe Checkout Session created");
+    console.log("✅ Stripe checkout session created:", session.id);
     res.json({ url: session.url });
   } catch (error) {
-    console.error("❌ Failed to start checkout:", error.message);
-    res.status(500).json({ error: "Failed to start checkout" });
+    console.error("❌ Failed to start checkout:", error);
+    res.status(500).json({ error: error.message });
   }
 });
 
-/* -----------------------------
-   STRIPE WEBHOOK
------------------------------ */
-
+/* ============================================================
+   2️⃣  STRIPE WEBHOOK (for post-payment updates)
+============================================================ */
 app.post(
   "/stripe/webhook",
   bodyParser.raw({ type: "application/json" }),
   async (req, res) => {
     const sig = req.headers["stripe-signature"];
+    let event;
 
     try {
-      const event = stripe.webhooks.constructEvent(
+      event = stripe.webhooks.constructEvent(
         req.body,
         sig,
         process.env.STRIPE_WEBHOOK_SECRET
       );
+    } catch (err) {
+      console.error("⚠️ Webhook signature verification failed:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
 
+    try {
       switch (event.type) {
         case "checkout.session.completed": {
           const session = event.data.object;
-          const { email, metadata } = session;
+          const { email, metadata, customer } = session;
           const plan_type = metadata?.plan_type || "unknown";
           const user_id = metadata?.user_id || null;
-          const stripe_customer_id = session.customer;
-          const subscription_status = "active";
 
           await supabase.from("user_subscriptions").upsert({
             user_id,
             email,
             plan_type,
-            stripe_customer_id,
-            subscription_status,
+            stripe_customer_id: customer,
+            subscription_status: "active",
           });
 
-          console.log(`💾 Stored subscription for ${email}`);
+          console.log(`💾 Subscription stored for ${email}`);
           break;
         }
+
         default:
           console.log(`Unhandled Stripe event type: ${event.type}`);
       }
 
       res.json({ received: true });
-    } catch (err) {
-      console.error("⚠️ Webhook signature verification failed:", err.message);
-      res.status(400).send(`Webhook Error: ${err.message}`);
+    } catch (error) {
+      console.error("❌ Error handling webhook:", error);
+      res.status(500).send("Webhook handler failed");
     }
   }
 );
 
-/* -----------------------------
-   FILE UPLOAD → BACKBLAZE B2
------------------------------ */
-
+/* ============================================================
+   3️⃣  FILE UPLOAD → BACKBLAZE B2
+============================================================ */
 app.post("/upload", upload.single("file"), async (req, res) => {
   try {
     const file = req.file;
@@ -169,11 +182,11 @@ app.post("/upload", upload.single("file"), async (req, res) => {
         "Content-Type": "b2/x-auto",
         "X-Bz-Content-Sha1": "do_not_verify",
       },
-      body: require("fs").createReadStream(file.path),
+      body: fs.createReadStream(file.path),
     });
 
     const uploadResult = await uploadRes.json();
-    console.log("✅ Uploaded file:", uploadResult.fileName);
+    console.log("✅ File uploaded to Backblaze:", uploadResult.fileName);
     res.json({ message: "Upload successful", uploadResult });
   } catch (err) {
     console.error("❌ Upload failed:", err.message);
@@ -181,10 +194,9 @@ app.post("/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-/* -----------------------------
-   SERVER START
------------------------------ */
-
+/* ============================================================
+   4️⃣  SERVER START
+============================================================ */
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
