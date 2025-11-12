@@ -1,5 +1,5 @@
 /* ------------------------------------------------------------
-   LectureAI Uploader + Stripe Checkout Server (Final Version)
+   LectureAI Uploader + Stripe + Backblaze Server (Final v4)
    Author: Gunner Endicott
 ------------------------------------------------------------- */
 
@@ -10,12 +10,12 @@ import multer from "multer";
 import fetch from "node-fetch";
 import Stripe from "stripe";
 import bodyParser from "body-parser";
-import { createClient } from "@supabase/supabase-js";
 import fs from "fs";
+import { createClient } from "@supabase/supabase-js";
 
 dotenv.config();
 
-/* ---------- CONFIG ---------- */
+/* ---------- CORE CONFIG ---------- */
 const app = express();
 const PORT = process.env.PORT || 10000;
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -23,8 +23,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const upload = multer({ dest: "uploads/" });
 
 /* ---------- MIDDLEWARE ---------- */
-
-// Allow your Bolt domains to access this API
+// Enable CORS for your Bolt sites
 app.use(
   cors({
     origin: [
@@ -37,7 +36,7 @@ app.use(
   })
 );
 
-// Parse JSON except for Stripe webhook (must stay raw)
+// Parse JSON normally, but keep webhook raw
 app.use((req, res, next) => {
   if (req.originalUrl === "/stripe/webhook") {
     next();
@@ -46,52 +45,57 @@ app.use((req, res, next) => {
   }
 });
 
-/* ---------- TEST ROUTE ---------- */
+/* ---------- BASE ROUTE ---------- */
 app.get("/", (req, res) => {
-  res.send("✅ LectureAI Uploader Server is live and running!");
+  res.send("✅ LectureAI Uploader backend is running successfully.");
 });
 
 /* ============================================================
-   1️⃣  STRIPE CHECKOUT SESSION
+   1️⃣  STRIPE CHECKOUT (Subscription + One-time)
 ============================================================ */
 app.post("/create-checkout-session", async (req, res) => {
   try {
     console.log("📩 Incoming checkout request:", req.body);
-    const { priceId, email, plan_type, user_id } = req.body;
+    const { plan_type, email, user_id } = req.body;
+    let priceId;
+    let mode;
+
+    if (plan_type === "subscription") {
+      priceId = process.env.PRICE_ID_SUBSCRIPTION;
+      mode = "subscription";
+    } else if (plan_type === "single") {
+      priceId = process.env.PRICE_ID_SINGLE;
+      mode = "payment";
+    }
 
     if (!priceId) {
-      console.error("❌ Missing priceId in request body");
-      return res.status(400).json({ error: "Missing priceId" });
+      console.error("❌ Missing or invalid plan_type:", plan_type);
+      return res.status(400).json({ error: "Invalid plan_type or missing priceId" });
     }
 
     const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
+      mode,
       payment_method_types: ["card"],
-      line_items: [
-        {
-          price: priceId, // ✅ Required field
-          quantity: 1,
-        },
-      ],
+      line_items: [{ price: priceId, quantity: 1 }],
       customer_email: email || undefined,
       metadata: {
-        plan_type: plan_type || "unknown",
+        plan_type,
         user_id: user_id || "none",
       },
       success_url: process.env.SUCCESS_URL,
       cancel_url: process.env.CANCEL_URL,
     });
 
-    console.log("✅ Stripe checkout session created:", session.id);
+    console.log(`✅ Stripe checkout session created: ${session.id}`);
     res.json({ url: session.url });
   } catch (error) {
     console.error("❌ Failed to start checkout:", error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: "Failed to start checkout" });
   }
 });
 
 /* ============================================================
-   2️⃣  STRIPE WEBHOOK (for post-payment updates)
+   2️⃣  STRIPE WEBHOOK HANDLER
 ============================================================ */
 app.post(
   "/stripe/webhook",
@@ -107,44 +111,36 @@ app.post(
         process.env.STRIPE_WEBHOOK_SECRET
       );
     } catch (err) {
-      console.error("⚠️ Webhook signature verification failed:", err.message);
+      console.error("⚠️ Webhook verification failed:", err.message);
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
     try {
-      switch (event.type) {
-        case "checkout.session.completed": {
-          const session = event.data.object;
-          const { email, metadata, customer } = session;
-          const plan_type = metadata?.plan_type || "unknown";
-          const user_id = metadata?.user_id || null;
+      if (event.type === "checkout.session.completed") {
+        const session = event.data.object;
+        const { email, metadata, customer } = session;
 
-          await supabase.from("user_subscriptions").upsert({
-            user_id,
-            email,
-            plan_type,
-            stripe_customer_id: customer,
-            subscription_status: "active",
-          });
+        await supabase.from("user_subscriptions").upsert({
+          user_id: metadata?.user_id || null,
+          email,
+          plan_type: metadata?.plan_type || "unknown",
+          stripe_customer_id: customer,
+          subscription_status: "active",
+        });
 
-          console.log(`💾 Subscription stored for ${email}`);
-          break;
-        }
-
-        default:
-          console.log(`Unhandled Stripe event type: ${event.type}`);
+        console.log(`💾 Subscription recorded for ${email}`);
       }
 
       res.json({ received: true });
     } catch (error) {
-      console.error("❌ Error handling webhook:", error);
+      console.error("❌ Webhook handling error:", error);
       res.status(500).send("Webhook handler failed");
     }
   }
 );
 
 /* ============================================================
-   3️⃣  FILE UPLOAD → BACKBLAZE B2
+   3️⃣  BACKBLAZE FILE UPLOAD
 ============================================================ */
 app.post("/upload", upload.single("file"), async (req, res) => {
   try {
@@ -200,4 +196,3 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
-
